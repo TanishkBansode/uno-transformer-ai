@@ -37,15 +37,19 @@ def play_game():
                         if game.is_valid_move(card):
                             color = None
                             if card.color is None:
-                                color = input("Choose color (Red, Blue, Green, Yellow): ")
+                                while True:
+                                    color = input("Choose color (Red, Blue, Green, Yellow): ").capitalize()
+                                    if color in Card.COLORS:
+                                        break
+                                    print("Invalid color! Please choose Red, Blue, Green, or Yellow.")
                             game.play_turn(0, idx, chosen_color=color)
                             break
                         else:
-                            print("Invalid move! Try again.")
+                            print(f"Invalid move! {card} cannot be played on {game.discard_pile[-1]} (Color: {game.current_color}). Try again.")
                     else:
                         print("Index out of range!")
                 except ValueError:
-                    print("Invalid input!")
+                    print("Invalid input! Please enter a number.")
         
         if len(game.players[0].hand) == 0:
             print("Human wins!")
