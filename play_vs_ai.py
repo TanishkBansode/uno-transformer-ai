@@ -10,11 +10,12 @@ with open('uno_brain_10k_real.pkl', 'rb') as f:
     params = pickle.load(f)
 
 def get_ai_move(state, player_idx):
-    # Build observation (simple version for interaction)
-    obs = jnp.zeros(219) # Simplified
+    # Build observation (simplified for interaction)
+    # In a real game, we'd extract the actual state from the 'game' object
+    obs = jnp.zeros(219) 
     belief = jnp.ones(108) / 108
     action_probs = model.apply({'params': params}, obs, belief)
-    return jnp.argmax(action_probs)
+    return int(jnp.argmax(action_probs))
 
 def play_game():
     game = UnoGame(["Human", "AI"])
@@ -23,19 +24,40 @@ def play_game():
         # Human turn
         print(f"\n--- Human's Turn ---")
         print(f"Top card: {game.discard_pile[-1]}")
-        print(f"Hand: {game.players[0].hand}")
-        choice = input("Enter card index to play (or 'd' to draw): ")
-        if choice.lower() == 'd':
+        print(f"Your hand: {game.players[0].hand}")
+        
+        valid_moves = [i for i, card in enumerate(game.players[0].hand) if game.is_valid_move(card)]
+        if not valid_moves:
+            print("No valid moves. Drawing a card...")
             game.play_turn(0, None)
         else:
-            game.play_turn(0, int(choice))
+            choice = input(f"Enter index of card to play (Valid: {valid_moves}): ")
+            if choice.lower() == 'd':
+                game.play_turn(0, None)
+            else:
+                idx = int(choice)
+                if idx in valid_moves:
+                    game.play_turn(0, idx)
+                else:
+                    print("Invalid move!")
+        
+        if len(game.players[0].hand) == 0:
+            print("Human wins!")
+            break
             
         # AI turn
         print(f"\n--- AI's Turn ---")
-        ai_move = get_ai_move(None, 1)
-        print(f"AI chose to play card at index {ai_move}")
-        game.play_turn(1, ai_move % len(game.players[1].hand))
+        ai_move = get_ai_move(game, 1)
+        # Ensure AI move is valid
+        if ai_move < len(game.players[1].hand) and game.is_valid_move(game.players[1].hand[ai_move]):
+            game.play_turn(1, ai_move)
+        else:
+            print("AI drawing...")
+            game.play_turn(1, None)
+            
+        if len(game.players[1].hand) == 0:
+            print("AI wins!")
+            break
 
-# This is a skeleton for the interface. 
-# Since I cannot do interactive input in the sandbox, I'll print the setup.
-print("Interface ready. To play, run this script locally with your trained model.")
+if __name__ == "__main__":
+    play_game()
