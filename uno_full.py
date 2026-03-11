@@ -21,9 +21,9 @@ class Deck:
     def _build_deck(self):
         for color in Card.COLORS:
             self.cards.append(Card(color, '0'))
-            for _ in range(2):
-                for val in Card.VALUES[1:]:
-                    self.cards.append(Card(color, val))
+            for val in Card.VALUES[1:]:
+                self.cards.append(Card(color, val))
+                self.cards.append(Card(color, val))
         for _ in range(4):
             self.cards.append(Card(None, 'Wild'))
             self.cards.append(Card(None, 'WildDrawFour'))
@@ -39,14 +39,12 @@ class Player:
         self.name = name
         self.hand = []
 
-    def draw_card(self, deck):
-        card = deck.draw()
-        if card:
-            self.hand.append(card)
+    def draw_card(self, deck, count=1):
+        for _ in range(count):
+            card = deck.draw()
+            if card:
+                self.hand.append(card)
         return card
-
-    def play_card(self, index):
-        return self.hand.pop(index)
 
 class UnoGame:
     def __init__(self, player_names):
@@ -58,9 +56,8 @@ class UnoGame:
         self.direction = 1
         self.current_player_idx = 0
 
-        for _ in range(7):
-            for player in self.players:
-                player.draw_card(self.deck)
+        for player in self.players:
+            player.draw_card(self.deck, 7)
         
         start_card = self.deck.draw()
         self.discard_pile.append(start_card)
@@ -68,7 +65,7 @@ class UnoGame:
         self.current_value = start_card.value
 
     def is_valid_move(self, card):
-        if card.color is None: return True # Wild
+        if card.color is None: return True
         if card.color == self.current_color: return True
         if card.value == self.current_value: return True
         return False
@@ -77,23 +74,37 @@ class UnoGame:
         player = self.players[player_idx]
         
         if card_idx is None:
-            card = player.draw_card(self.deck)
-            print(f"{player.name} drew a card.")
+            player.draw_card(self.deck)
+            self.current_player_idx = (self.current_player_idx + self.direction) % len(self.players)
             return
 
         card = player.hand[card_idx]
         if self.is_valid_move(card):
-            player.play_card(card_idx)
+            player.hand.pop(card_idx)
             self.discard_pile.append(card)
             
-            # Handle Wilds
-            if card.color is None:
-                self.current_color = chosen_color or random.choice(Card.COLORS)
-                self.current_value = None
+            # Power card logic
+            next_player = (self.current_player_idx + self.direction) % len(self.players)
+            
+            if card.value == 'Skip':
+                self.current_player_idx = (next_player + self.direction) % len(self.players)
+            elif card.value == 'Reverse':
+                self.direction *= -1
+                self.current_player_idx = (self.current_player_idx + self.direction) % len(self.players)
+            elif card.value == 'DrawTwo':
+                self.players[next_player].draw_card(self.deck, 2)
+                self.current_player_idx = (next_player + self.direction) % len(self.players)
+            elif card.value == 'WildDrawFour':
+                self.players[next_player].draw_card(self.deck, 4)
+                self.current_color = chosen_color
+                self.current_player_idx = (next_player + self.direction) % len(self.players)
+            elif card.color is None: # Wild
+                self.current_color = chosen_color
+                self.current_player_idx = next_player
             else:
                 self.current_color = card.color
                 self.current_value = card.value
-            print(f"{player.name} played {card}")
+                self.current_player_idx = next_player
         else:
             print("Invalid move!")
 
