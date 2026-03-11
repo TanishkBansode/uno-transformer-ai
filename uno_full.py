@@ -55,15 +55,13 @@ class UnoGame:
         self.discard_pile = []
         self.current_color = None
         self.current_value = None
-        self.direction = 1 # 1 for clockwise, -1 for counter-clockwise
+        self.direction = 1
         self.current_player_idx = 0
 
-        # Initial deal
         for _ in range(7):
             for player in self.players:
                 player.draw_card(self.deck)
         
-        # Start discard pile
         start_card = self.deck.draw()
         self.discard_pile.append(start_card)
         self.current_color = start_card.color
@@ -75,10 +73,9 @@ class UnoGame:
         if card.value == self.current_value: return True
         return False
 
-    def play_turn(self, player_idx, card_idx=None):
+    def play_turn(self, player_idx, card_idx=None, chosen_color=None):
         player = self.players[player_idx]
         
-        # If no card index provided, try to draw
         if card_idx is None:
             card = player.draw_card(self.deck)
             print(f"{player.name} drew a card.")
@@ -88,13 +85,15 @@ class UnoGame:
         if self.is_valid_move(card):
             player.play_card(card_idx)
             self.discard_pile.append(card)
-            self.current_color = card.color
-            self.current_value = card.value
+            
+            # Handle Wilds
+            if card.color is None:
+                self.current_color = chosen_color or random.choice(Card.COLORS)
+                self.current_value = None
+            else:
+                self.current_color = card.color
+                self.current_value = card.value
             print(f"{player.name} played {card}")
         else:
             print("Invalid move!")
 
-# Simple test
-game = UnoGame(["Alice", "Bob"])
-print(f"Game started. Top card: {game.discard_pile[-1]}")
-print(f"Alice's hand: {game.players[0].hand}")
