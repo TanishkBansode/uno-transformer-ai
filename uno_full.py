@@ -55,21 +55,35 @@ class UnoGame:
         self.current_player_idx = 0
         self.direction = 1
         self.discard_pile = []
-        
-        # Initialize starting card
+
+        # Initialize starting card (must be a coloured card)
         start_card = self.deck.draw()
         while start_card.color is None:
             self.deck.cards.append(start_card)
             self.deck.shuffle()
             start_card = self.deck.draw()
-            
+
         self.current_color = start_card.color
         self.current_value = start_card.value
         self.discard_pile.append(start_card)
-        
+
         for player in self.players:
             player.draw_card(self.deck, 7)
 
+    # ------------------------------------------------------------------
+    def _ensure_deck(self):
+        """
+        If the draw pile is empty, reshuffle all discard pile cards
+        except the top card back into the deck.  This is standard UNO
+        rules and prevents infinite draw-loops when the deck runs dry.
+        """
+        if len(self.deck.cards) == 0 and len(self.discard_pile) > 1:
+            top = self.discard_pile[-1]
+            self.deck.cards = self.discard_pile[:-1]
+            self.discard_pile = [top]
+            self.deck.shuffle()
+
+    # ------------------------------------------------------------------
     def is_valid_move(self, card):
         if card.color is None: return True
         if card.color == self.current_color: return True
@@ -78,24 +92,24 @@ class UnoGame:
 
     def play_turn(self, player_idx, card_idx, chosen_color=None):
         player = self.players[player_idx]
-        
+
         if card_idx is None:
+            self._ensure_deck()
             player.draw_card(self.deck)
             self.current_player_idx = (self.current_player_idx + self.direction) % len(self.players)
             return {"status": "continue"}
 
         card = player.hand[card_idx]
-        
+
         if not self.is_valid_move(card):
             raise ValueError("Invalid move")
 
         if card.color is None and chosen_color not in Card.COLORS:
             raise ValueError(f"chosen_color must be one of {Card.COLORS}")
 
-        # Logic to play card
         player.hand.pop(card_idx)
         self.discard_pile.append(card)
-        
+
         if len(player.hand) == 0:
             return {"winner": player.name}
 
@@ -103,30 +117,37 @@ class UnoGame:
             self.current_color = card.color
             self.current_value = card.value
             self.current_player_idx = (self.current_player_idx + 2 * self.direction) % len(self.players)
+
         elif card.value == 'Reverse':
             self.current_color = card.color
             self.current_value = card.value
             self.direction *= -1
             self.current_player_idx = (self.current_player_idx + self.direction) % len(self.players)
+
         elif card.value == 'DrawTwo':
             self.current_color = card.color
             self.current_value = card.value
             next_player = self.players[(self.current_player_idx + self.direction) % len(self.players)]
+            self._ensure_deck()
             next_player.draw_card(self.deck, 2)
             self.current_player_idx = (self.current_player_idx + 2 * self.direction) % len(self.players)
+
         elif card.value == 'Wild':
             self.current_color = chosen_color
             self.current_value = card.value
             self.current_player_idx = (self.current_player_idx + self.direction) % len(self.players)
+
         elif card.value == 'WildDrawFour':
             self.current_color = chosen_color
             self.current_value = card.value
             next_player = self.players[(self.current_player_idx + self.direction) % len(self.players)]
+            self._ensure_deck()
             next_player.draw_card(self.deck, 4)
             self.current_player_idx = (self.current_player_idx + 2 * self.direction) % len(self.players)
+
         else:
             self.current_color = card.color
             self.current_value = card.value
             self.current_player_idx = (self.current_player_idx + self.direction) % len(self.players)
-            
+
         return {"status": "continue"}

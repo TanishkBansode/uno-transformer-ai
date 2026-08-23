@@ -1,0 +1,67 @@
+name: Train UNO AI
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: 'Training minutes (keep below ~320)'
+        required: false
+        default: '300'
+  schedule:
+    - cron: '0 2 * * *'   # nightly at 02:00 UTC
+
+permissions:
+  contents: write
+
+concurrency:
+  group: uno-training     # never run two training jobs at once (checkpoint clobbering)
+  cancel-in-progress: false
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # hosted-runner hard cap is 360; leave margin for setup+commit
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Train (resumes from committed checkpoint)
+        env:
+          MPLBACKEND: Agg
+        run: |
+          python train.py \
+            --resume \
+            --time-limit-minutes "${{ github.event_name == 'workflow_dispatch' && inputs.minutes || '310' }}" \
+            --checkpoint-in uno_brain_final.pkl \
+            --checkpoint-out uno_brain_final.pkl \
+            --best-out uno_brain_best.pkl \
+            --curves training_curves.png
+
+      - name: Upload checkpoints as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: uno-checkpoints-${{ github.run_number }}
+          path: |
+            uno_brain_final.pkl
+            uno_brain_best.pkl
+            training_curves.png
+          retention-days: 14
+
+      - name: Commit updated checkpoints back to repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add uno_brain_final.pkl uno_brain_best.pkl training_curves.png
+          if git diff --cached --quiet; then
+            echo "No checkpoint changes to commit"
+          else
+            git commit -m "Train: update checkpoints (run #${{ github.run_number }})"
+            git push
+          fi
