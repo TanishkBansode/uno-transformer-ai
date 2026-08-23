@@ -270,7 +270,8 @@ def collect_episode(learn_params, seat_params):
         if "winner" in result:
             done = True
             winner_pid = pid
-            bufs[pid]['rew'][-1] = WIN_REWARD
+            if bufs[pid]['rew']:                     # random agents keep no buffer
+                bufs[pid]['rew'][-1] = WIN_REWARD
             for i in range(4):
                 if i != pid and bufs[i]['rew']:
                     bufs[i]['rew'][-1] += LOSS_REWARD
@@ -591,7 +592,8 @@ def train(args):
                 self_wr = np.mean(hist['wins'][-WIN_WINDOW:])
                 rate    = ep_done / max(time.time() - t_start, 1e-9)
                 snap_s  = f"{wr_snap:.1%}" if not np.isnan(wr_snap) else "  n/a"
-                print(f"Ep {ep_done:6d} | Loss {hist['loss'][-1]:+.4f} "
+                last_loss = hist['loss'][-1] if hist['loss'] else float('nan')
+                print(f"Ep {ep_done:6d} | Loss {last_loss:+.4f} "
                       f"| Self-WR {self_wr:.1%} | vs Random {wr_rand:.1%} "
                       f"| vs Snap {snap_s} | Steps {steps:3d} "
                       f"| {rate:.0f} ep/s", flush=True)
