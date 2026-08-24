@@ -49,12 +49,16 @@ class Player:
         return drawn
 
 class UnoGame:
-    def __init__(self, player_names):
+    def __init__(self, player_names, elimination_mode=False):
         self.players = [Player(name) for name in player_names]
         self.deck = Deck()
         self.current_player_idx = 0
         self.direction = 1
         self.discard_pile = []
+        # elimination / ranking mode (UI) — last man standing loses
+        self.elimination_mode = elimination_mode
+        self.finished = []          # list of player indices in order they emptied hand
+        self.ranking = []           # list of player names in order they finished
 
         # Initialize starting card (must be a coloured card)
         start_card = self.deck.draw()
@@ -71,6 +75,24 @@ class UnoGame:
             player.draw_card(self.deck, 7)
 
     # ------------------------------------------------------------------
+    def _active_indices(self):
+        return [i for i in range(len(self.players)) if i not in self.finished]
+
+    def _next_active(self, from_idx, steps=1):
+        """Return the player index `steps` active turns ahead of from_idx."""
+        if len(self.finished) >= len(self.players):
+            return from_idx
+        idx = from_idx
+        for _ in range(steps):
+            idx = (idx + self.direction) % len(self.players)
+            guard = 0
+            while idx in self.finished:
+                idx = (idx + self.direction) % len(self.players)
+                guard += 1
+                if guard > len(self.players):
+                    break
+        return idx
+
     def _ensure_deck(self):
         """
         If the draw pile is empty, reshuffle all discard pile cards
@@ -91,13 +113,21 @@ class UnoGame:
         return False
 
     def play_turn(self, player_idx, card_idx, chosen_color=None):
+        # Skip turns for already-finished players (elimination mode)
+        if self.elimination_mode and player_idx in self.finished:
+            self.current_player_idx = self._next_active(player_idx, 1)
+            return {"status": "continue"}
+
         player = self.players[player_idx]
 
         if card_idx is None:
             self._ensure_deck()
             player.draw_card(self.deck)
-            self.current_player_idx = (self.current_player_idx + self.direction) % len(self.players)
-            return {"status": "continue"}
+            if self.elimination_mode:
+                self.current_player_idx = self._next_active(player_idx, 1)
+            else:
+                self.current_player_idx = (self.current_player_idx + self.direction) % len(self.players)
+            return {"status": "continue", "drew": True}
 
         card = player.hand[card_idx]
 
@@ -110,44 +140,87 @@ class UnoGame:
         player.hand.pop(card_idx)
         self.discard_pile.append(card)
 
-        if len(player.hand) == 0:
-            return {"winner": player.name}
-
-        if card.value == 'Skip':
-            self.current_color = card.color
-            self.current_value = card.value
-            self.current_player_idx = (self.current_player_idx + 2 * self.direction) % len(self.players)
-
-        elif card.value == 'Reverse':
-            self.current_color = card.color
-            self.current_value = card.value
-            self.direction *= -1
-            self.current_player_idx = (self.current_player_idx + self.direction) % len(self.players)
-
-        elif card.value == 'DrawTwo':
-            self.current_color = card.color
-            self.current_value = card.value
-            next_player = self.players[(self.current_player_idx + self.direction) % len(self.players)]
-            self._ensure_deck()
-            next_player.draw_card(self.deck, 2)
-            self.current_player_idx = (self.current_player_idx + 2 * self.direction) % len(self.players)
-
-        elif card.value == 'Wild':
+        # Update colour / value first so ranking state is consistent
+        if card.color is None:
             self.current_color = chosen_color
-            self.current_value = card.value
-            self.current_player_idx = (self.current_player_idx + self.direction) % len(self.players)
-
-        elif card.value == 'WildDrawFour':
-            self.current_color = chosen_color
-            self.current_value = card.value
-            next_player = self.players[(self.current_player_idx + self.direction) % len(self.players)]
-            self._ensure_deck()
-            next_player.draw_card(self.deck, 4)
-            self.current_player_idx = (self.current_player_idx + 2 * self.direction) % len(self.players)
-
         else:
             self.current_color = card.color
-            self.current_value = card.value
+        self.current_value = card.value
+
+        # --- win / elimination handling ---
+        if len(player.hand) == 0:
+            if not self.elimination_mode:
+                return {"winner": player.name}
+            # elimination / ranking mode — last man standing loses
+            self.finished.append(player_idx)
+            self.ranking.append(player.name)
+            active = self._active_indices()
+            if len(active) <= 1:
+                loser = self.players[active[0]].name if active else None
+                return {"finished": True, "ranking": self.ranking.copy(),
+                        "loser": loser, "eliminated": player.name}
+            # apply the card's effect even when the player goes out, then
+            # advance to the next *active* player.
+            if card.value == 'Reverse':
+                self.direction *= -1
+                self.current_player_idx = self._next_active(player_idx, 1)
+            elif card.value in ('Skip', 'DrawTwo', 'WildDrawFour'):
+                # Draw targets get their cards even when finisher goes out
+                if card.value == 'DrawTwo':
+                    nxt = self._next_active(player_idx, 1)
+                    self._ensure_deck()
+                    self.players[nxt].draw_card(self.deck, 2)
+                elif card.value == 'WildDrawFour':
+                    nxt = self._next_active(player_idx, 1)
+                    self._ensure_deck()
+                    self.players[nxt].draw_card(self.deck, 4)
+                # Skip the next active player (covers Skip + the draw cards)
+                self.current_player_idx = self._next_active(player_idx, 2)
+            else:
+                # Wild or number card
+                self.current_player_idx = self._next_active(player_idx, 1)
+            return {"eliminated": player.name, "ranking": self.ranking.copy()}
+
+        # --- normal (non-winning) card effects ---
+        if self.elimination_mode:
+            if card.value == 'Skip':
+                self.current_player_idx = self._next_active(player_idx, 2)
+            elif card.value == 'Reverse':
+                self.direction *= -1
+                self.current_player_idx = self._next_active(player_idx, 1)
+            elif card.value == 'DrawTwo':
+                nxt = self._next_active(player_idx, 1)
+                self._ensure_deck()
+                self.players[nxt].draw_card(self.deck, 2)
+                self.current_player_idx = self._next_active(player_idx, 2)
+            elif card.value == 'WildDrawFour':
+                nxt = self._next_active(player_idx, 1)
+                self._ensure_deck()
+                self.players[nxt].draw_card(self.deck, 4)
+                self.current_player_idx = self._next_active(player_idx, 2)
+            else:  # Wild or number
+                self.current_player_idx = self._next_active(player_idx, 1)
+            return {"status": "continue"}
+
+        # classic mode (training) — simple modulo arithmetic
+        if card.value == 'Skip':
+            self.current_player_idx = (self.current_player_idx + 2 * self.direction) % len(self.players)
+        elif card.value == 'Reverse':
+            self.direction *= -1
+            self.current_player_idx = (self.current_player_idx + self.direction) % len(self.players)
+        elif card.value == 'DrawTwo':
+            nxt = (self.current_player_idx + self.direction) % len(self.players)
+            self._ensure_deck()
+            self.players[nxt].draw_card(self.deck, 2)
+            self.current_player_idx = (self.current_player_idx + 2 * self.direction) % len(self.players)
+        elif card.value == 'Wild':
+            self.current_player_idx = (self.current_player_idx + self.direction) % len(self.players)
+        elif card.value == 'WildDrawFour':
+            nxt = (self.current_player_idx + self.direction) % len(self.players)
+            self._ensure_deck()
+            self.players[nxt].draw_card(self.deck, 4)
+            self.current_player_idx = (self.current_player_idx + 2 * self.direction) % len(self.players)
+        else:
             self.current_player_idx = (self.current_player_idx + self.direction) % len(self.players)
 
         return {"status": "continue"}
