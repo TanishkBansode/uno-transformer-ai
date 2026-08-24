@@ -59,7 +59,8 @@ EVAL_GAMES_HEURISTIC= 200
 SAVE_INTERVAL       = 1000          # episodes between rolling checkpoints
 SNAP_INTERVAL       = 200           # episodes between league snapshots (only on improvement now)
 SNAPSHOT_POOL       = 32            # larger league for ELO diversity
-EARLY_STOP_PATIENCE = 15            # eval intervals without heuristic improvement → stop
+EARLY_STOP_PATIENCE = 50            # evals without heuristic improvement → stop (10k eps)
+EARLY_STOP_MIN_EPS  = 40_000        # never early-stop before this many episodes in session
 
 OPP_CURRENT         = 0.55          # slightly lower current to increase diversity
 OPP_SNAPSHOT        = 0.30          # more snapshot play
@@ -723,6 +724,7 @@ def train(args):
 
     deadline = time.time() + args.time_limit_minutes * 60 if args.time_limit_minutes else None
     t_start  = time.time()
+    session_start_ep = ep_done          # episodes completed before this session began
     buf = {'obs': [], 'bel': [], 'act': [], 'mask': [],
            'adv': [], 'ret': [], 'logp': []}
 
@@ -805,10 +807,16 @@ def train(args):
                           f" -> saved {args.best_out}", flush=True)
                 else:
                     patience_counter += 1
-                    if patience_counter >= EARLY_STOP_PATIENCE:
+                    session_eps = ep_done - session_start_ep
+                    if (patience_counter >= EARLY_STOP_PATIENCE
+                            and session_eps >= EARLY_STOP_MIN_EPS):
                         print(f"Early stopping: no heuristic improvement for "
-                              f"{EARLY_STOP_PATIENCE} evals ({EARLY_STOP_PATIENCE*EVAL_INTERVAL} episodes).", flush=True)
+                              f"{EARLY_STOP_PATIENCE} evals "
+                              f"({session_eps} episodes this session).", flush=True)
                         break
+                    if patience_counter % 10 == 0:
+                        print(f"  Patience {patience_counter}/{EARLY_STOP_PATIENCE} "
+                              f"({session_eps}/{EARLY_STOP_MIN_EPS} min episodes)", flush=True)
 
                 # archive only on improvement (real league)
                 if improved:
