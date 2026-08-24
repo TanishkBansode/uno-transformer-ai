@@ -33,7 +33,13 @@ def load_params(path):
         ckpt = pickle.load(f)
     if ckpt.get("version") != 3:
         raise ValueError(f"{path}: not a v3 checkpoint")
-    return jax.tree_util.tree_map(jnp.asarray, ckpt["params"])
+    params = jax.tree_util.tree_map(jnp.asarray, ckpt["params"])
+    # migrate old 5-token checkpoints to new 8-token architecture
+    if params.get('pos_emb', None) is not None and params['pos_emb'].shape == (5, 96):
+        print(f"Migrating {path} pos_emb 5->8 tokens", flush=True)
+        new_rows = jax.random.normal(jax.random.PRNGKey(0), (3, 96)) * 0.02
+        params['pos_emb'] = jnp.concatenate([params['pos_emb'], new_rows], axis=0)
+    return params
 
 
 def find_model(cli_path):

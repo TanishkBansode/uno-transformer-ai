@@ -15,6 +15,7 @@ import os
 import pickle
 import random
 import time
+from collections import Counter
 
 import matplotlib
 if not os.environ.get("DISPLAY"):
@@ -52,14 +53,17 @@ PLAY_REWARD         = 0.01
 DRAW_REWARD         = -0.02
 
 EVAL_INTERVAL       = 200           # episodes between evaluations
-EVAL_GAMES_RANDOM   = 50
-EVAL_GAMES_SNAPSHOT = 25
+EVAL_GAMES_RANDOM   = 200
+EVAL_GAMES_SNAPSHOT = 100
+EVAL_GAMES_HEURISTIC= 200
 SAVE_INTERVAL       = 1000          # episodes between rolling checkpoints
-SNAP_INTERVAL       = 200           # episodes between league snapshots
-SNAPSHOT_POOL       = 8             # frozen opponents kept in memory
+SNAP_INTERVAL       = 200           # episodes between league snapshots (only on improvement now)
+SNAPSHOT_POOL       = 32            # larger league for ELO diversity
+EARLY_STOP_PATIENCE = 15            # eval intervals without heuristic improvement → stop
 
-OPP_CURRENT         = 0.60          # prob an opponent seat uses the learning policy
-OPP_SNAPSHOT        = 0.25          # prob it uses a frozen snapshot (rest: random agent)
+OPP_CURRENT         = 0.55          # slightly lower current to increase diversity
+OPP_SNAPSHOT        = 0.30          # more snapshot play
+# remaining 0.15 → heuristic opponent
 
 PRINT_INTERVAL      = 50
 PLOT_INTERVAL       = 10
@@ -80,7 +84,9 @@ NUM_ACTIONS         = ACT_DRAW + 1                             # 61
 
 ALL_VALUES          = Card.VALUES + Card.WILD_VALUES           # 15
 NUM_TYPES           = len(Card.COLORS) * len(Card.VALUES) + len(Card.WILD_VALUES)
-OBS_SIZE            = 4 + 15 + 4 + NUM_TYPES                   # 77
+HISTORY_LEN         = 4
+HISTORY_SIZE        = HISTORY_LEN * (4 + 15)                  # 76 — last 4 plays as colour+value one-hots
+OBS_SIZE            = 4 + 15 + 4 + NUM_TYPES + HISTORY_SIZE   # 153
 
 COLORED_INDEX       = {(c, v): ci * len(Card.VALUES) + vi
                        for ci, c in enumerate(Card.COLORS)
@@ -88,7 +94,7 @@ COLORED_INDEX       = {(c, v): ci * len(Card.VALUES) + vi
 WILD_HAND_INDEX     = {v: NUM_COLORED_ACTIONS + i
                        for i, v in enumerate(Card.WILD_VALUES)}
 
-BATCH_CAP           = EPISODES_PER_UPDATE * 800                # covers MAX_STEPS worst case
+BATCH_CAP           = 2048                                     # was 6400 (94% padding) — now 2048 ~5× smaller
 MB_SIZE             = BATCH_CAP // MINIBATCHES
 
 
@@ -103,12 +109,25 @@ def get_observation(game, player_idx):
         obs[4 + ALL_VALUES.index(game.current_value)] = 1.0
     for i in range(4):
         obs[19 + i] = len(game.players[i].hand) / 108.0
+    # hand: count 0.5 per copy (max 2 copies → 1.0) — fixes binary bug
     for card in game.players[player_idx].hand:
         idx = COLORED_INDEX.get((card.color, card.value))
         if idx is None:
             idx = WILD_HAND_INDEX.get(card.value)
         if idx is not None:
-            obs[23 + idx] += 1.0
+            obs[23 + idx] += 0.5
+            if obs[23 + idx] > 1.0:
+                obs[23 + idx] = 1.0
+    # history: last 4 plays (colour 4 + value 15 =19 per slot)
+    hist_base = 23 + NUM_TYPES
+    for s in range(HISTORY_LEN):
+        if s < len(game.discard_pile):
+            card = game.discard_pile[-(s + 1)]
+            base = hist_base + s * 19
+            if card.color in Card.COLORS:
+                obs[base + Card.COLORS.index(card.color)] = 1.0
+            if card.value in ALL_VALUES:
+                obs[base + 4 + ALL_VALUES.index(card.value)] = 1.0
     return obs
 
 
@@ -226,6 +245,88 @@ def random_action(game, pid):
     return int(np.random.choice(legal))
 
 
+def heuristic_action(game, pid):
+    """Hand-coded strong baseline: save wilds, block opponents close to winning."""
+    mask = get_action_mask(game, pid)
+    legal = np.flatnonzero(mask)
+    hand = game.players[pid].hand
+    # opponent close to winning? prioritize action cards
+    opp_sizes = [len(p.hand) for i, p in enumerate(game.players) if i != pid]
+    must_block = min(opp_sizes) <= 2 if opp_sizes else False
+
+    # collect playable cards grouped by type
+    playable = []
+    for c in hand:
+        if not game.is_valid_move(c):
+            continue
+        if c.color is not None:
+            playable.append((COLORED_INDEX[(c.color, c.value)], c))
+        elif c.value == 'Wild':
+            playable.append((None, c))  # placeholder
+        else:
+            playable.append((None, c))
+
+    if not playable:
+        return ACT_DRAW
+
+    # if must block and we have an action card, play it
+    if must_block:
+        for idx, c in enumerate(hand):
+            if not game.is_valid_move(c):
+                continue
+            if c.value in ('DrawTwo', 'Skip', 'WildDrawFour'):
+                if c.color is None:
+                    # choose most common colour in hand
+                    cols = [x.color for x in hand if x.color]
+                    col = Counter(cols).most_common(1)[0][0] if cols else 'Red'
+                    base = ACT_WILD_BASE if c.value == 'Wild' else ACT_WDF_BASE
+                    # WildDrawFour case
+                    if c.value == 'WildDrawFour':
+                        base = ACT_WDF_BASE
+                    else:
+                        # c is WildDrawFour or Wild — already handled
+                        pass
+                    # find correct wild action
+                    if c.value == 'Wild':
+                        return ACT_WILD_BASE + Card.COLORS.index(col)
+                    else:
+                        return ACT_WDF_BASE + Card.COLORS.index(col)
+                else:
+                    return COLORED_INDEX[(c.color, c.value)]
+
+    # otherwise prefer the colour we have most of
+    color_counts = Counter([c.color for c in hand if c.color])
+    best_col = color_counts.most_common(1)[0][0] if color_counts else None
+
+    # score playable by whether it matches best_col
+    best = None
+    best_score = -1
+    for c in hand:
+        if not game.is_valid_move(c):
+            continue
+        score = 0
+        if c.color == best_col:
+            score += 2
+        if c.value not in ('Wild', 'WildDrawFour'):
+            score += 1  # prefer saving wilds
+        if score > best_score:
+            best_score = score
+            best = c
+
+    if best is None:
+        return int(np.random.choice(legal))
+
+    if best.color is not None:
+        return COLORED_INDEX[(best.color, best.value)]
+    # wild
+    cols = [x.color for x in hand if x.color]
+    col = Counter(cols).most_common(1)[0][0] if cols else 'Red'
+    if best.value == 'Wild':
+        return ACT_WILD_BASE + Card.COLORS.index(col)
+    else:
+        return ACT_WDF_BASE + Card.COLORS.index(col)
+
+
 # ---------------------------------------------------------------------------
 # Episode collection — league self-play
 # ---------------------------------------------------------------------------
@@ -245,8 +346,12 @@ def collect_episode(learn_params, seat_params):
         pid    = game.current_player_idx
         params = learn_params if pid == 0 else seat_params[pid]
 
-        if params is None:
-            action = random_action(game, pid)
+        is_heuristic = isinstance(params, str) and params == "heuristic"
+        if params is None or is_heuristic:
+            if is_heuristic:
+                action = heuristic_action(game, pid)
+            else:
+                action = random_action(game, pid)
             obs  = get_observation(game, pid)
             bel  = get_belief_state(game)
             mask = get_action_mask(game, pid)
@@ -258,9 +363,8 @@ def collect_episode(learn_params, seat_params):
         step_reward = DRAW_REWARD if action == ACT_DRAW else PLAY_REWARD
         draws += int(action == ACT_DRAW)
 
-        if params is not None:
+        if params is not None and not is_heuristic:
             # Only transitions taken by a learned policy enter the PPO buffer.
-            # (Random-agent moves have no valid old-log-prob.)
             b = bufs[pid]
             b['obs'].append(obs);    b['bel'].append(bel)
             b['act'].append(action); b['mask'].append(mask)
@@ -353,6 +457,26 @@ def evaluate_vs_snapshot(params, snap_params, n_games=EVAL_GAMES_SNAPSHOT):
     return wins / max(n_games, 1)
 
 
+def evaluate_vs_heuristic(params, n_games=EVAL_GAMES_HEURISTIC):
+    wins = 0
+    for _ in range(n_games):
+        game = UnoGame(["P0", "P1", "P2", "P3"])
+        done, steps = False, 0
+        while not done and steps < MAX_STEPS:
+            steps += 1
+            pid = game.current_player_idx
+            if pid == 0:
+                action, _, _, _, _, _ = sample_action(params, game, 0)
+            else:
+                action = heuristic_action(game, pid)
+            result, _ = execute_action(game, pid, action)
+            if "winner" in result:
+                done = True
+                if result["winner"] == "P0":
+                    wins += 1
+    return wins / max(n_games, 1)
+
+
 # ---------------------------------------------------------------------------
 # Checkpointing
 # ---------------------------------------------------------------------------
@@ -383,6 +507,20 @@ def load_checkpoint(path):
     print(f"Resumed from {path} (episode {ckpt['episode']}, "
           f"best vs-random WR {ckpt['best_wr']:.1%})", flush=True)
     return params, opt_state, ckpt['episode'], ckpt['best_wr']
+
+
+def try_migrate_checkpoint(old_params, new_template):
+    """Migrate old (5,96) pos_emb to new (8,96) by keeping first 5 rows."""
+    old_pos = old_params.get('pos_emb', None)
+    new_pos = new_template.get('pos_emb', None)
+    if old_pos is not None and new_pos is not None and old_pos.shape != new_pos.shape:
+        print(f"Migrating pos_emb {old_pos.shape} -> {new_pos.shape}", flush=True)
+        import jax.random as jrandom
+        key = jrandom.PRNGKey(0)
+        new_rows = jrandom.normal(key, (new_pos.shape[0]-old_pos.shape[0], new_pos.shape[1])) * 0.02
+        old_params = dict(old_params)
+        old_params['pos_emb'] = jnp.concatenate([old_pos, new_rows], axis=0)
+    return old_params
 
 
 def init_params(key):
@@ -420,6 +558,12 @@ def update_plot(fig, axes, hist):
     if hist['eval_rand']:
         ax_wins.plot(hist['eval_ep'], hist['eval_rand'], color='darkgreen',
                      linewidth=1.8, marker='o', markersize=4, label="vs Random WR")
+    if hist.get('eval_heur') and hist['eval_heur']:
+        # filter nans for plotting
+        heur = [x if not np.isnan(x) else None for x in hist['eval_heur']]
+        # matplotlib will break on None, so plot with mask
+        ax_wins.plot(hist['eval_ep'], hist['eval_heur'], color='orangered',
+                     linewidth=1.8, marker='^', markersize=4, label="vs Heuristic WR")
     if hist['eval_snap']:
         ax_wins.plot(hist['eval_ep'], hist['eval_snap'], color='teal',
                      linewidth=1.4, marker='s', markersize=3,
@@ -493,12 +637,29 @@ def run_ppo_update(params, opt_state, optimizer, data):
     return params, opt_state, last_loss
 
 
-def sample_seat_params(learn_params, snapshots):
+def sample_snapshot_elo(snapshots, ratings):
+    """ELO-weighted sampling: higher-rated snapshots sampled more."""
+    if not snapshots:
+        return None
+    # ratings centered at 1500, scale with exp
+    exps = [np.exp((r - 1500) / 200.0) for r in ratings]
+    total = sum(exps)
+    probs = [e / total for e in exps]
+    idx = int(np.random.choice(len(snapshots), p=probs))
+    return snapshots[idx]
+
+
+def sample_seat_params(learn_params, snapshots, ratings):
     r = random.random()
     if r < OPP_CURRENT or not snapshots:
         return learn_params
     if r < OPP_CURRENT + OPP_SNAPSHOT:
-        return snapshots[random.randrange(len(snapshots))]
+        # ELO-weighted snapshot
+        snap = sample_snapshot_elo(snapshots, ratings)
+        return snap if snap is not None else learn_params
+    # remaining 15%: 10% heuristic, 5% random
+    if r < OPP_CURRENT + OPP_SNAPSHOT + 0.10:
+        return "heuristic"
     return None                                            # uniform random agent
 
 
@@ -510,24 +671,47 @@ def train(args):
     np.random.seed(args.seed)
 
     key     = jax.random.PRNGKey(args.seed)
-    params  = init_params(key)
+    new_params = init_params(key)
+    # cosine decay LR — decays over ~100k episodes * ~50 steps avg ≈ 5M steps, alpha 0.05 keeps 5% LR at end
+    lr_schedule = optax.cosine_decay_schedule(init_value=LEARNING_RATE, decay_steps=100_000, alpha=0.05)
     optimizer = optax.chain(optax.clip_by_global_norm(GRAD_CLIP_NORM),
-                            optax.adam(LEARNING_RATE))
+                            optax.adam(lr_schedule))
+    params = new_params
     opt_state = optimizer.init(params)
     ep_done   = 0
     best_wr   = -1.0
+    best_heuristic_wr = -1.0
 
     if args.resume and os.path.exists(args.checkpoint_in):
         try:
-            params, opt_state, ep_done, best_wr = load_checkpoint(args.checkpoint_in)
+            loaded_params, loaded_opt, ep_done, best_wr = load_checkpoint(args.checkpoint_in)
+            # migrate pos_emb if architecture changed (5->8 tokens)
+            if loaded_params.get('pos_emb', None) is not None and new_params.get('pos_emb', None) is not None:
+                if loaded_params['pos_emb'].shape != new_params['pos_emb'].shape:
+                    loaded_params = try_migrate_checkpoint(loaded_params, new_params)
+                    # optimizer state is shape-mismatched — reinit from migrated params
+                    print("Reinitialising optimizer due to architecture change", flush=True)
+                    params = loaded_params
+                    opt_state = optimizer.init(params)
+                else:
+                    params, opt_state = loaded_params, loaded_opt
+            else:
+                params, opt_state = loaded_params, loaded_opt
+            # best_heuristic not stored in old checkpoints — keep -1 to force first archive
+            best_heuristic_wr = -1.0
         except (ValueError, EOFError, pickle.UnpicklingError) as e:
             print(f"WARNING: could not resume ({e}); starting fresh", flush=True)
             ep_done, best_wr = 0, -1.0
+            best_heuristic_wr = -1.0
+            params, opt_state = new_params, optimizer.init(new_params)
 
     snapshots = []
+    snapshot_ratings = []  # parallel ELO ratings, init 1500
     hist = {'ep': [], 'steps': [], 'wins': [], 'draws': [],
             'loss': [], 'loss_ep': [], 'eval_ep': [],
-            'eval_rand': [], 'eval_snap': []}
+            'eval_rand': [], 'eval_snap': [], 'eval_heur': []}
+    best_heuristic_wr = -1.0
+    patience_counter = 0
 
     interactive = 'agg' not in matplotlib.get_backend().lower()
     fig = axes = None
@@ -550,7 +734,7 @@ def train(args):
 
             seat_params = [None] * 4
             for i in range(1, 4):
-                seat_params[i] = sample_seat_params(params, snapshots)
+                seat_params[i] = sample_seat_params(params, snapshots, snapshot_ratings)
 
             rollout = collect_episode(params, seat_params)
             (obs_l, bel_l, act_l, mask_l, adv_l, ret_l,
@@ -576,34 +760,63 @@ def train(args):
                 hist['loss'].append(loss_val)
                 hist['loss_ep'].append(ep_done)
 
-            if ep_done % SNAP_INTERVAL == 0:
-                snapshots.append(to_numpy_tree(params))
-                if len(snapshots) > SNAPSHOT_POOL:
-                    snapshots.pop(0)
-
             if ep_done % EVAL_INTERVAL == 0:
                 wr_rand = evaluate_vs_random(params)
+                wr_heur = evaluate_vs_heuristic(params)
                 wr_snap = (evaluate_vs_snapshot(params, snapshots[-1])
                            if snapshots else float('nan'))
+                # ELO update for the snapshot we just played
+                if snapshots and not np.isnan(wr_snap):
+                    # current's expected score vs snapshot
+                    snap_rating = snapshot_ratings[-1]
+                    # we don't track current rating, assume 1500 + (best_heuristic delta)
+                    # use 1500 as current baseline for ELO calc
+                    exp_snap = 1.0 / (1.0 + 10 ** ((1500 - snap_rating) / 400.0))
+                    # actual score for snapshot is 1 - wr_snap (since wr_snap is current's win rate)
+                    actual_snap = 1.0 - wr_snap
+                    snapshot_ratings[-1] += 32 * (actual_snap - exp_snap)
+
                 hist['eval_ep'].append(ep_done)
                 hist['eval_rand'].append(wr_rand)
                 hist['eval_snap'].append(wr_snap)
+                hist['eval_heur'].append(wr_heur)
 
                 self_wr = np.mean(hist['wins'][-WIN_WINDOW:])
                 rate    = ep_done / max(time.time() - t_start, 1e-9)
                 snap_s  = f"{wr_snap:.1%}" if not np.isnan(wr_snap) else "  n/a"
                 last_loss = hist['loss'][-1] if hist['loss'] else float('nan')
                 print(f"Ep {ep_done:6d} | Loss {last_loss:+.4f} "
-                      f"| Self-WR {self_wr:.1%} | vs Random {wr_rand:.1%} "
-                      f"| vs Snap {snap_s} | Steps {steps:3d} "
+                      f"| Self-WR {self_wr:.1%} | vs Rand {wr_rand:.1%} "
+                      f"| vs Heur {wr_heur:.1%} | vs Snap {snap_s} | Steps {steps:3d} "
                       f"| {rate:.0f} ep/s", flush=True)
 
-                if wr_rand > best_wr:
-                    best_wr = wr_rand
+                # best tracking now uses heuristic (harder) instead of random
+                improved = False
+                if wr_heur > best_heuristic_wr:
+                    best_heuristic_wr = wr_heur
+                    patience_counter = 0
+                    improved = True
+                    # also track best random for checkpoint compatibility
+                    if wr_rand > best_wr:
+                        best_wr = wr_rand
                     save_checkpoint(args.best_out, params, opt_state,
                                     ep_done, best_wr)
-                    print(f"  New best vs-random WR {best_wr:.1%} "
-                          f"-> saved {args.best_out}", flush=True)
+                    print(f"  New best vs-heuristic WR {wr_heur:.1%} (vs Rand {wr_rand:.1%})"
+                          f" -> saved {args.best_out}", flush=True)
+                else:
+                    patience_counter += 1
+                    if patience_counter >= EARLY_STOP_PATIENCE:
+                        print(f"Early stopping: no heuristic improvement for "
+                              f"{EARLY_STOP_PATIENCE} evals ({EARLY_STOP_PATIENCE*EVAL_INTERVAL} episodes).", flush=True)
+                        break
+
+                # archive only on improvement (real league)
+                if improved:
+                    snapshots.append(to_numpy_tree(params))
+                    snapshot_ratings.append(1500.0)
+                    if len(snapshots) > SNAPSHOT_POOL:
+                        snapshots.pop(0)
+                        snapshot_ratings.pop(0)
 
             if not args.no_plot and ep_done % PLOT_INTERVAL == 0 and hist['ep']:
                 update_plot(fig, axes, hist)
